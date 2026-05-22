@@ -54,16 +54,20 @@ db.events.insertOne({
 ```
 
 The `_id` unique index makes duplicate receipt safe across all pods. If MongoDB
-returns duplicate key `E11000`, the event is already durable, so the handler can
-return `202 Accepted`. For a new event, the handler sends a small SQS Standard
-message containing `event_id` and returns `202 Accepted` only after the event is
-durable and the enqueue attempt has succeeded.
+returns duplicate key `E11000`, the event is already durable. On the duplicate
+path the handler still sends an SQS message before returning `202 Accepted` —
+workers are idempotent, so an extra message is cheap insurance against a missed
+enqueue on the original attempt. For a new event, the handler sends a small SQS
+Standard message containing `event_id` and returns `202 Accepted` only after the
+event is durable and the enqueue attempt has succeeded.
 
 **Asynchronous after 2xx:** workers consume SQS messages at least once. They load
 the event from MongoDB and perform idempotent side effects:
 
-- update the card document only if this event is newer than the card's current
-  issuer timestamp/version;
+- update the card document only if this event is strictly newer by
+  `(occurred_at, event_id)` than the card's last applied event — the lexical
+  tiebreaker handles same-second collisions, and the strict comparison makes
+  re-applying the same event a no-op so worker retries are safe;
 - insert one audit entry with a unique key on `event_id`;
 - insert one in-app message with a unique key on `event_id`;
 - claim one notification outbox record with an atomic conditional update, send
@@ -84,8 +88,10 @@ it must not roll the card document backward.
 - **(b) MongoDB is unreachable for 30 seconds.** The handler cannot make the
   event durable, so it returns 5xx and Cal retries. If MongoDB accepts the insert
   but the handler crashes before SQS enqueue, the event is still in `events`.
-  Cal retries will hit the duplicate-key path, and a scheduled janitor also
-  re-enqueues old `RECEIVED` events so a missed enqueue cannot strand the event.
+  Cal retries will hit the duplicate-key path, and a scheduled janitor (runs every
+  30 seconds, re-enqueues events stuck in `RECEIVED` for more than 60 seconds)
+  also re-enqueues old `RECEIVED` events so a missed enqueue cannot strand the
+  event.
 
 - **(c) The push provider is down for 2 hours.** The event and the notification
   outbox record remain in MongoDB. The worker fails the provider call, releases
@@ -131,11 +137,23 @@ ack their duplicate SQS delivery, and do nothing. Audit and in-app messages use
 unique inserts/upserts on `event_id`, so duplicate workers either create the row
 once or observe that it already exists.
 
-The hard boundary is the external push provider. If it supports idempotency
-keys, we send `event_id` so retrying after a timeout does not create a second
-user-visible push. If it does not support idempotency, no backend can perfectly
-guarantee external exactly-once delivery after "sent but response lost"; then
-the honest guarantee is exactly one internal owner plus retry/alert behavior.
+The Mongo lease is the authoritative claim. SQS visibility timeout is set to
+roughly match `lease_until` so the queue and the claim agree on who owns the
+in-flight attempt; long provider calls heartbeat-extend both. If they diverge,
+either SQS redelivers while the claim is still held (the new worker sees the
+claim and no-ops, but the original work is left without an SQS backstop) or the
+lease expires while the first worker is still mid-call (a second worker can
+claim and issue a duplicate push).
+
+The hard boundary is the external push provider. The order is claim → push →
+mark `SENT`. If the provider accepts but the "mark SENT" write fails, the lease
+expires and a later worker re-pushes. With an idempotency key (`event_id`), the
+provider de-dupes and this is safe. Without one, no backend can perfectly
+guarantee external exactly-once delivery after "sent but response lost" — we
+deliberately accept the rare duplicate over the rare lost push, because for
+`card.blocked` the user-visible cost of a missed notification is higher than a
+repeated one. The honest guarantee is exactly one internal owner plus
+retry/alert behavior.
 
 **TTL / lifetime.** The event dedup record should live at least longer than Cal's
 retry horizon, for example 90 days, and can be retained longer for support.
@@ -145,8 +163,9 @@ history.
 
 **What wins on a race.** For duplicate receipt, the first MongoDB insert wins.
 For side effects, the first successful conditional claim or unique insert wins.
-For card state, the newest issuer event wins by `occurred_at` or issuer version,
-not by the order workers happen to process messages.
+For card state, the newest issuer event wins by `(occurred_at, event_id)` (or
+issuer version if Cal exposes one), not by the order workers happen to process
+messages.
 
 ## 4. Observability
 
