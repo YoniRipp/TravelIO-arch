@@ -17,14 +17,15 @@ flowchart LR
         Q[(SQS Standard<br/>at-least-once queue)]
         W[Worker pool<br/>ECS Fargate]
         DLQ[(SQS DLQ)]
-        JAN[Janitor job<br/>sweeps stuck RECEIVED events]
+        JAN[Janitor job<br/>sweeps stuck RECEIVED<br/>and lapsed SENDING]
     end
 
     subgraph Data["MongoDB state"]
-        E[(events<br/>_id = event_id)]
-        C[(cards<br/>conditional state update)]
+        E[(events<br/>_id = event_id<br/>RECEIVED → DONE)]
+        C[(cards<br/>newer-wins update)]
         A[(audit<br/>unique event_id)]
-        O[(notification + in-app outbox<br/>unique event_id)]
+        N[(notification_outbox<br/>PENDING → SENDING → SENT)]
+        I[(in_app<br/>unique event_id)]
         SM[Secrets Manager<br/>Cal HMAC secret]
     end
 
@@ -32,22 +33,23 @@ flowchart LR
     OBS[OpenTelemetry + CloudWatch<br/>logs, traces, metrics, alerts]
 
     Cal -->|HTTPS + HMAC signature| WAF --> ALB --> H
-    H -->|read secret| SM
-    H -->|verify raw body signature| H
-    H -->|insertOne event<br/>unique event_id| E
+    H -->|read cached secret| SM
+    H -->|insertOne event<br/>majority write concern| E
+    H -->|insertOne outbox<br/>status PENDING| N
     H -->|SendMessage event_id| Q
-    H -->|202 Accepted| ALB --> Cal
+    H -->|202 Accepted| Cal
 
     Q --> W
     W -->|load raw event| E
-    W -->|update if newer occurred_at/version| C
-    W -->|insert/upsert unique event_id| A
-    W -->|insert/upsert and claim unique event_id| O
-    W -->|send with idempotency key = event_id| PUSH
-    W -->|mark side effects done| E
+    W -->|update if newer| C
+    W -->|unique insert| A
+    W -->|unique insert| I
+    W -->|conditional claim<br/>PENDING → SENDING| N
+    W -->|send idempotency_key = event_id| PUSH
+    W -->|mark SENT + event DONE| E
     Q -. maxReceiveCount .-> DLQ
 
-    JAN -->|find old RECEIVED| E
+    JAN -->|find old RECEIVED<br/>and lapsed SENDING| E
     JAN -->|re-enqueue event_id| Q
 
     H -. logs/traces .-> OBS
@@ -73,6 +75,7 @@ sequenceDiagram
     Handler->>Handler: verify HMAC over raw body + timestamp window
     Handler->>Mongo: insertOne event {_id: event_id, status: RECEIVED, raw}
     Note over Mongo: unique _id makes duplicate receipt safe
+    Handler->>Mongo: insertOne notification_outbox {_id: event_id, status: PENDING}
     Handler->>SQS: SendMessage({event_id})
     Handler-->>Cal: 202 Accepted
 
@@ -81,11 +84,11 @@ sequenceDiagram
     Worker->>Mongo: update card only if event is newer
     Worker->>Mongo: insert audit entry unique on event_id
     Worker->>Mongo: insert in-app message unique on event_id
-    Worker->>Mongo: claim notification outbox PENDING to SENDING
+    Worker->>Mongo: claim outbox PENDING → SENDING (conditional update)
     Note over Worker,Mongo: one worker gets the claim; duplicates get null
     Worker->>Push: sendNotification(..., idempotency_key = event_id)
     Push-->>Worker: accepted
-    Worker->>Mongo: mark notification SENT and event DONE
+    Worker->>Mongo: mark outbox SENT and event DONE
     Worker->>SQS: deleteMessage
 ```
 
@@ -107,17 +110,17 @@ sequenceDiagram
         CalB->>PodB: POST event_id=evt_123
     end
 
-    PodA->>Mongo: insertOne({_id: evt_123})
+    PodA->>Mongo: insertOne event {_id: evt_123}
     Mongo-->>PodA: OK
-    PodB->>Mongo: insertOne({_id: evt_123})
+    PodB->>Mongo: insertOne event {_id: evt_123}
     Mongo-->>PodB: E11000 duplicate key
     PodA-->>CalA: 202
     PodB-->>CalB: 202
 
     par
-        WorkerA->>Mongo: claim notification {_id: evt_123, status: PENDING}
+        WorkerA->>Mongo: claim outbox {_id: evt_123, status: PENDING}
     and
-        WorkerB->>Mongo: claim notification {_id: evt_123, status: PENDING}
+        WorkerB->>Mongo: claim outbox {_id: evt_123, status: PENDING}
     end
 
     Mongo-->>WorkerA: claimed document
