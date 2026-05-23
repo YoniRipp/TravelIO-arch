@@ -4,57 +4,50 @@
 
 ```mermaid
 flowchart LR
-    Cal[Cal<br/>card issuer]
+    Cal[Cal - card issuer]
 
-    subgraph Edge["Public edge (AWS)"]
-        WAF[CloudFront + WAF<br/>rate limit, size/method filters]
-        ALB[ALB<br/>TLS termination]
+    subgraph Edge["Public edge - AWS"]
+        WAF[CloudFront + WAF]
+        ALB[ALB - TLS termination]
     end
 
     subgraph App["VPC - private"]
         direction TB
-        H[Webhook handler<br/>ECS Fargate 3+ tasks<br/>POST /webhooks/cal/card-status]
-        Q[(SQS Standard<br/>at-least-once queue)]
-        W[Worker pool<br/>ECS Fargate]
+        H[Webhook handler - ECS Fargate x3+]
+        Q[(SQS queue - standard)]
+        W[Worker pool - ECS Fargate]
         DLQ[(SQS DLQ)]
-        JAN[Janitor job<br/>sweeps stuck RECEIVED<br/>and lapsed SENDING]
+        JAN[Janitor job - scheduled]
     end
 
-    subgraph Data["MongoDB state"]
-        E[(events<br/>_id = event_id<br/>RECEIVED → DONE)]
-        C[(cards<br/>newer-wins update)]
-        A[(audit<br/>unique event_id)]
-        N[(notification_outbox<br/>PENDING → SENDING → SENT)]
-        I[(in_app<br/>unique event_id)]
-        SM[Secrets Manager<br/>Cal HMAC secret]
+    subgraph Data["State"]
+        M[(MongoDB)]
+        SM[Secrets Manager]
     end
 
-    PUSH[Push provider<br/>best-effort, rate-limited]
-    OBS[OpenTelemetry + CloudWatch<br/>logs, traces, metrics, alerts]
+    PUSH[Push provider - 3rd party]
+    OBS[OTEL + CloudWatch]
 
-    Cal -->|HTTPS + HMAC signature| WAF --> ALB --> H
-    H -->|read cached secret| SM
-    H -->|insertOne event<br/>majority write concern| E
-    H -->|insertOne outbox<br/>status PENDING| N
-    H -->|SendMessage event_id| Q
-    H -->|202 Accepted| Cal
+    Cal -->|"HTTPS + HMAC sig"| WAF
+    WAF --> ALB
+    ALB --> H
+
+    H -->|"verify sig"| SM
+    H -->|"insertOne, unique index on event_id"| M
+    H -->|"enqueue, dedup id = event_id"| Q
+    H -->|"202 Accepted"| ALB
 
     Q --> W
-    W -->|load raw event| E
-    W -->|update if newer| C
-    W -->|unique insert| A
-    W -->|unique insert| I
-    W -->|conditional claim<br/>PENDING → SENDING| N
-    W -->|send idempotency_key = event_id| PUSH
-    W -->|mark SENT + event DONE| E
-    Q -. maxReceiveCount .-> DLQ
+    W -->|"conditional update: PERSISTED to NOTIFIED"| M
+    W -->|"send push"| PUSH
+    W -->|"conditional update: NOTIFIED to AUDITED"| M
+    Q -.->|"maxReceiveCount exceeded"| DLQ
 
-    JAN -->|find old RECEIVED<br/>and lapsed SENDING| E
-    JAN -->|re-enqueue event_id| Q
+    JAN -->|"sweep stuck RECEIVED"| M
+    JAN -->|"re-enqueue"| Q
 
-    H -. logs/traces .-> OBS
-    W -. logs/traces .-> OBS
-    DLQ -. alert .-> OBS
+    H -.->|"logs/traces"| OBS
+    W -.->|"logs/traces"| OBS
 ```
 
 ## Request sequence - happy path
@@ -70,60 +63,46 @@ sequenceDiagram
     participant Worker
     participant Push as Push provider
 
-    Cal->>ALB: POST /webhooks/cal/card-status<br/>X-Cal-Signature, X-Cal-Timestamp
+    Cal->>ALB: POST /webhooks/cal/card-status
     ALB->>Handler: forward to one pod
-    Handler->>Handler: verify HMAC over raw body + timestamp window
-    Handler->>Mongo: insertOne event {_id: event_id, status: RECEIVED, raw}
-    Note over Mongo: unique _id makes duplicate receipt safe
-    Handler->>Mongo: insertOne notification_outbox {_id: event_id, status: PENDING}
-    Handler->>SQS: SendMessage({event_id})
+    Handler->>Handler: verify HMAC + timestamp window
+    Handler->>Mongo: insertOne with _id = event_id, status = RECEIVED
+    Note over Mongo: unique index on _id: duplicate returns E11000, treated as success
+    Handler->>SQS: SendMessage with dedup_id = event_id
     Handler-->>Cal: 202 Accepted
 
-    SQS->>Worker: deliver event_id at least once
-    Worker->>Mongo: load event by event_id
-    Worker->>Mongo: update card only if event is newer
-    Worker->>Mongo: insert audit entry unique on event_id
-    Worker->>Mongo: insert in-app message unique on event_id
-    Worker->>Mongo: claim outbox PENDING → SENDING (conditional update)
-    Note over Worker,Mongo: one worker gets the claim; duplicates get null
-    Worker->>Push: sendNotification(..., idempotency_key = event_id)
-    Push-->>Worker: accepted
-    Worker->>Mongo: mark outbox SENT and event DONE
+    SQS->>Worker: deliver message
+    Worker->>Mongo: findOneAndUpdate where status = PERSISTED, set status = NOTIFIED
+    Note over Worker,Mongo: only the pod that flips PERSISTED to NOTIFIED owns the push
+    Worker->>Push: sendNotification for card_id, user_id
+    Push-->>Worker: 200 OK
+    Worker->>Mongo: findOneAndUpdate where status = NOTIFIED, set status = AUDITED
+    Worker->>Mongo: insert audit entry, update card state
     Worker->>SQS: deleteMessage
 ```
 
-## Race resolution - duplicate deliveries and workers
+## Race resolution — two pods, same event_id
 
 ```mermaid
 sequenceDiagram
     participant CalA as Cal delivery 1
-    participant CalB as Cal retry
-    participant PodA as Handler Pod A
-    participant PodB as Handler Pod B
-    participant WorkerA as Worker A
-    participant WorkerB as Worker B
+    participant CalB as Cal delivery 2 - retry
+    participant PodA as Pod A
+    participant PodB as Pod B
     participant Mongo
 
-    par
-        CalA->>PodA: POST event_id=evt_123
+    par concurrent deliveries
+        CalA->>PodA: POST event_id = evt_123
     and
-        CalB->>PodB: POST event_id=evt_123
+        CalB->>PodB: POST event_id = evt_123
     end
 
-    PodA->>Mongo: insertOne event {_id: evt_123}
-    Mongo-->>PodA: OK
-    PodB->>Mongo: insertOne event {_id: evt_123}
+    PodA->>Mongo: insertOne _id = evt_123, status = RECEIVED
+    Mongo-->>PodA: OK - winner
+    PodB->>Mongo: insertOne _id = evt_123, status = RECEIVED
     Mongo-->>PodB: E11000 duplicate key
     PodA-->>CalA: 202
-    PodB-->>CalB: 202
+    PodB-->>CalB: 202 - idempotent, same outcome
 
-    par
-        WorkerA->>Mongo: claim outbox {_id: evt_123, status: PENDING}
-    and
-        WorkerB->>Mongo: claim outbox {_id: evt_123, status: PENDING}
-    end
-
-    Mongo-->>WorkerA: claimed document
-    Mongo-->>WorkerB: null
-    Note over WorkerA,WorkerB: Worker A owns the push. Worker B acks/no-ops.
+    Note over PodA,PodB: Both ack to Cal. Only PodA enqueued to SQS. Worker uses conditional findOneAndUpdate to ensure exactly one push.
 ```
