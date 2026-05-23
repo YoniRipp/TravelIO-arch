@@ -1,4 +1,4 @@
-# Architecture — Cal Card-Status Webhook Ingestion
+# Architecture - Cal Card-Status Webhook Ingestion
 
 ## Component view
 
@@ -50,7 +50,7 @@ flowchart LR
     W -.->|"logs/traces"| OBS
 ```
 
-## Request sequence — happy path
+## Request sequence - happy path
 
 ```mermaid
 sequenceDiagram
@@ -60,7 +60,7 @@ sequenceDiagram
     participant Handler as Fargate handler
     participant Mongo
     participant SQS
-    participant Worker as Worker
+    participant Worker
     participant Push as Push provider
 
     Cal->>ALB: POST /webhooks/cal/card-status
@@ -101,7 +101,6 @@ sequenceDiagram
     Mongo-->>PodA: OK - winner
     PodB->>Mongo: insertOne _id = evt_123, status = RECEIVED
     Mongo-->>PodB: E11000 duplicate key
-
     PodA-->>CalA: 202
     PodB-->>CalB: 202 - idempotent, same outcome
 

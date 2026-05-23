@@ -1,173 +1,132 @@
-# Webhook Ingestion — Design
+# Webhook Ingestion - Design
 
-`POST /webhooks/cal/card-status` is a public endpoint that receives card-lifecycle
-events from Cal and turns each one into **at most one** push notification, **at most
-one** audit entry, and a card-state update in MongoDB — across multiple Fargate
-pods, Cal retries, network blips, and process crashes.
-
-Diagram: see `architecture.md` (Mermaid renders on GitHub).
-
-## Shape of the system
-
-Cal → CloudFront/WAF → ALB → Fargate handler → (HMAC verify) → atomic insert
-into Mongo `events` (unique index on `event_id`) → SQS → 202 → worker pool →
-state-machine update + push + audit. The handler does the minimum durable work
-before acking; everything else is deferred to a worker behind a queue with a DLQ.
+`POST /webhooks/cal/card-status` turns each accepted Cal event into durable
+state in MongoDB, one audit entry, one in-app message, and one push
+notification — exactly once per event across multiple ECS Fargate pods. See
+`architecture.md` for diagrams.
 
 ## 1. Edge / perimeter
 
-CloudFront + AWS WAF in front of the ALB. WAF rate-limits per source IP and drops
-obvious garbage (bad methods, oversized bodies, known-bad ASNs) before any compute
-runs. TLS terminates at the ALB.
+CloudFront and AWS WAF sit in front of the ALB; WAF rate-limits abuse, blocks
+oversized or invalid methods, and can allowlist Cal egress IPs if published.
+TLS terminates at the ALB.
 
-Authenticity is established by an HMAC-SHA256 signature: Cal signs
-`timestamp + "." + body` with a shared secret and sends it as `X-Cal-Signature`
-plus `X-Cal-Timestamp`. The handler recomputes the HMAC in constant time, rejects
-anything where the timestamp is more than five minutes off wall clock, and the
-secret lives in AWS Secrets Manager with rotation. If Cal publishes egress IP
-ranges, we add them as a WAF allowlist as defence in depth — but the HMAC is the
-real gate, not the IP filter.
+Authenticity is enforced in the handler with an HMAC-SHA256 signature. Cal
+signs `timestamp + "." + raw_body` and sends `X-Cal-Signature` plus
+`X-Cal-Timestamp`. The handler verifies against the raw body with
+constant-time comparison, rejects timestamps outside a 5-minute window
+(tolerates NTP skew), and reads the rotatable secret from AWS Secrets Manager
+with short-TTL caching.
 
-An attacker who curls the endpoint without a valid signature gets a flat
-`401 Unauthorized` with an empty body. No event shape leaks, no Mongo write, no
-SQS message, and the failure is logged at debug level only so attacker traffic
-doesn't drown real signal.
+An attacker hitting the endpoint receives a flat `401 Unauthorized` with empty
+body — no parsing, no Mongo write, no SQS message, low-detail log so we leak
+no schema or secret state. Schema-invalid but signed payloads return `400`
+without persisting, and we alert on the 400 rate because Cal would otherwise
+retry indefinitely. v1 validates presence of `event_id`, `event_type`,
+`card_id`, `user_id`, and `occurred_at`; unknown event types are stored and
+audited but skip type-specific side effects until handlers ship.
 
 ## 2. Sync vs. async + durability
 
-**Synchronous, before 2xx:** parse, verify signature and timestamp, then
-`db.events.insertOne({ _id: event_id, status: "RECEIVED", raw, received_at })`.
-The `events` collection has a **unique index on `_id`**, so a duplicate delivery
-fails fast with `E11000` — we catch it and treat it as success (the event is
-already durable, nothing more to do here). Then `SendMessage` to SQS with
-`MessageDeduplicationId = event_id`. Return **202 Accepted**.
+**Synchronous before 2xx.** Verify HMAC and timestamp, validate schema, then
+insert into `events` with `_id = event_id`, `status = RECEIVED`, and the raw
+payload — using majority write concern so a primary failover does not lose
+it. In the same handler we also insert a `notification_outbox` row keyed on
+`event_id` with `status = PENDING`; this is the single source of truth for
+which events still need a push, and creating it synchronously keeps the
+worker's claim a pure conditional update with no upsert race. The handler
+then enqueues an SQS Standard message containing only `event_id` and returns
+`202 Accepted`. On duplicate (`E11000`) it still enqueues as cheap insurance
+against a missed enqueue on the original attempt; workers are idempotent. The
+handler is stateless, so autoscaling is safe — correctness lives in MongoDB's
+unique indexes, not in process memory.
 
-**Asynchronous, after 2xx:** workers consume SQS and drive each event through a
-state machine — `RECEIVED → PERSISTED → NOTIFIED → AUDITED → DONE` — using
-conditional `findOneAndUpdate` operations (see §3). Card state and audit entry
-land in their respective collections; the SQS message is deleted only after the
-terminal transition.
+**Asynchronous after 2xx.** Workers consume SQS at least once, load the event,
+then idempotently: update `cards` only if the new event is strictly newer by
+`(occurred_at, event_id)` — the lexical tiebreaker handles same-second
+collisions, strict comparison makes retries a no-op, and a late-older event
+is audited but never rolls the card backward; unique-insert `audit` and
+`in_app` keyed on `event_id`; claim the outbox row (§3); push; mark `SENT`
+and event `DONE`.
 
-**Failure walk-through:**
+`events.status` is `RECEIVED → DONE` (or `FAILED` after DLQ).
+`notification_outbox.status` is `PENDING → SENDING → SENT`. A janitor every
+30s re-enqueues `events` stuck in `RECEIVED` over 60s and resets outbox rows
+whose `SENDING` lease has lapsed.
 
-- **(a) Process crashes after receiving the request but before doing anything.**
-  Cal's TCP connection drops or it sees a 5xx. Nothing was written to Mongo or
-  SQS. Cal retries; the retry succeeds against another pod. No duplicate work,
-  no lost event.
+**Failures.** **(a)** Crash before anything: nothing written; Cal retries on
+dropped connection or 5xx; a later pod handles the same `event_id`.
+**(b1)** Mongo unreachable for 30s: handler returns 5xx, Cal retries until
+recovery. **(b2)** Mongo accepted the insert but the handler died before SQS:
+the event sits as `RECEIVED`; Cal's retry hits the dup-key path and
+re-enqueues, and the janitor backstops it. **(c)** Push provider down for 2h:
+event and outbox row remain in MongoDB; the worker fails the call, the lease
+expires, SQS redelivers with backoff; exhausted retries land in the DLQ with
+an alert, and the operator replays from durable records when the provider
+recovers. An ECS task drain during deploy returns 5xx for in-flight requests
+and Cal retries hit a healthy task.
 
-- **(b) MongoDB unreachable for 30 seconds.** The synchronous `insertOne` fails;
-  the handler returns 5xx; Cal retries. Once Mongo is back, the retry succeeds.
-  Awkward subcase: handler inserts into Mongo, then crashes before the SQS
-  enqueue. The next Cal retry hits the duplicate-key path and finds
-  `status = RECEIVED` with no downstream progress — it re-enqueues (the SQS
-  dedup id makes this safe). A scheduled janitor sweeps any `RECEIVED` event
-  older than ~5 minutes back onto the queue as a belt-and-braces safety net
-  for the case where Cal does not retry.
+## 3. Exactly-once side effects
 
-- **(c) Push provider down for 2 hours.** Worker call to the provider fails;
-  the SQS message returns to visibility with exponential backoff. The event
-  document stays at `NOTIFIED`'s precondition (`PERSISTED`) until the call
-  finally succeeds. After `maxReceiveCount` it lands in the DLQ; an operator
-  drains the DLQ when the provider recovers. Card state and audit writes are
-  not blocked by the push outage if we sequence them after `NOTIFIED` — but
-  the brief says one notification per event, so we keep push on the critical
-  path before audit closes the event.
+**Dedup key.** `event_id` is `events._id`. MongoDB rejects a duplicate insert
+atomically with `E11000`, so there is no check-then-write race on receipt.
+The handler also creates the PENDING `notification_outbox` row; `audit` and
+`in_app` use unique inserts on `event_id`.
 
-At each stage the event lives in *durable* storage: the raw body on the Mongo
-`events` doc from the first millisecond after signature verification, and an
-in-flight reference in SQS until the terminal transition. Memory is never the
-only copy.
+**Worker claim.** Workers race on one conditional update of the outbox row:
+match `_id = event_id` AND `status = PENDING` AND (no `lease_until` OR
+`lease_until < now`); set `status = SENDING`, `owner = pod_id`, `lease_until =
+now + 2 min`. MongoDB serializes this on the document, so exactly one worker
+returns a non-null document and owns the push; losing workers get `null`, ack
+the duplicate SQS delivery, and no-op. Audit and in-app duplicates similarly
+collapse to first-write-wins.
 
-## 3. Exactly-once side effects — the critical constraint
+**Lease ↔ visibility.** SQS visibility timeout is set near the lease, and a
+background ticker on the worker extends both during long provider calls. If
+they diverge we accept either a no-op duplicate delivery or — rarely — a
+duplicate push.
 
-**Dedup key.** `event_id` itself, used as `_id` of the Mongo `events` document.
-Unique by construction of the collection's primary index — Mongo will reject a
-second insert with `E11000`, no application-level check-then-write.
+**Hard boundary at the provider.** Order is claim → push → mark `SENT`. If
+"mark SENT" fails after the provider accepted, the lease expires and another
+worker re-pushes; with `event_id` as the provider idempotency key this is
+safe, and without one we deliberately accept the rare duplicate over the
+rare lost push because for `card.blocked` a missed notification is more
+user-visible than a repeated one.
 
-**Atomic race-resolving operation.** Not the insert (that only dedups *receipt*).
-The push and the audit are guarded by a **conditional update on the event's
-current status**:
-
-```
-events.findOneAndUpdate(
-  { _id: event_id, status: "PERSISTED" },
-  { $set: { status: "NOTIFIED",
-            notified_by: pod_id,
-            notified_at: now() } }
-)
-```
-
-Mongo serialises this update on a single document. Exactly one pod sees a
-non-null return; that pod owns sending the push. Every other pod (whether a
-retry that slipped through SQS dedup or a worker that picked up the same
-message after visibility timeout) gets `null` back, logs `dedup_lost`, deletes
-its SQS message, and does nothing. The same pattern guards the audit write
-(`NOTIFIED → AUDITED`). The pod that wins the transition is the *only* pod
-that calls the push provider.
-
-**TTL / lifetime.** The `events` document is the durable record of "we received
-this event and what we did with it" — it stays. If retention is a concern, a
-`dedup_expires_at` field with a TTL index of 90 days is enough: Cal's retry
-window is hours, not months. Audit entries live in a separate collection with
-their own retention policy (likely much longer for compliance).
-
-**What wins on a race.** The first writer to flip the status field wins. The
-ordering is decided by Mongo, not by wall-clock or pod identity, so it is
-deterministic per document and oblivious to clock skew across pods. Losers ack
-silently — they have done the right thing by *not* duplicating the side effect.
-
-**Why not Redis `SETNX` or DynamoDB conditional writes.** Both work. Both add a
-second source of truth and a window where Mongo and the dedup store disagree on
-crash. Keeping the dedup key co-located with the data it guards — one store, one
-truth — is simpler and removes a class of "the lock said yes but the doc says
-no" bugs.
+**TTL.** `events` lives ≥ Cal's retry horizon (e.g. 90 days); audit follows
+compliance retention; outbox rows are kept until support no longer needs
+delivery history. First Mongo insert wins on receipt, first claim or unique
+insert wins on side effects, newest `(occurred_at, event_id)` wins on card
+state.
 
 ## 4. Observability
 
-**Structured JSON logs**, one line per stage, with `event_id`, `card_id`,
-`event_type`, `pod_id`, `trace_id`, stage name, latency, outcome, dedup
-win/loss, push-provider response code. **OpenTelemetry traces** with one span
-per stage; `trace_id` is propagated into SQS message attributes so the async
-half of the flow joins the same trace as the synchronous receive.
+Structured JSON logs carry `event_id`, `card_id`, `user_id`, `event_type`,
+`pod_id`, `trace_id`, stage, outcome, claim/duplicate result, and provider
+response. OpenTelemetry spans cover receive → Mongo insert → SQS enqueue →
+worker claim → side-effect writes → push send; `trace_id` propagates via SQS
+message attributes. Alerts cover 5xx and 4xx rate, signature failures, SQS
+oldest-message age, DLQ depth, stuck `RECEIVED` and `SENDING` counts,
+provider error/rate-limit rate, and Mongo write latency.
 
-**Alerts.** 5xx rate on the endpoint; signature-failure rate (possible attack,
-or rotated secret not yet propagated); SQS age-of-oldest-message (backlog);
-DLQ depth > 0 (something is failing repeatedly); push-provider error rate;
-janitor sweep size > 0 (events are getting stuck in `RECEIVED`, which means a
-real bug, not a transient).
+We never log PAN, CVV, HMAC secrets, raw signature headers, full raw
+payloads, or unnecessary cardholder PII; `event_id`, `card_id`, and `user_id`
+are tokenized references safe to log.
 
-**Do not log.** Card PAN, CVV, full cardholder PII, the HMAC secret, the raw
-signature header. `card_id` and `user_id` are tokenised references and safe.
-
-**"Customer says they didn't get a notification 8 hours ago."**
-
-1. Get `user_id` / `card_id` from support.
-2. Query Mongo `events` for that `card_id` in the time window. Pull the
-   `event_id` and its terminal `status`.
-3. If `status = NOTIFIED` or `DONE`: the push was sent. Read the stored
-   provider response code — either the provider accepted it (device or
-   delivery problem downstream of us) or returned an error we didn't notice
-   (provider problem; check provider dashboard).
-4. If `status = PERSISTED`: the worker never advanced it. Search the DLQ for
-   `event_id`; pull worker logs by `trace_id`; check whether the push provider
-   was throwing in that window.
-5. If no event doc at all: search edge logs for the `card_id` and time window.
-   Either Cal never sent it, or the signature check rejected it (check the
-   signature-failure log line — that's why we keep it even though it's noisy).
+**"Didn't get a notification 8 hours ago":** query `events` by `card_id` and
+window → check the event and its side-effect rows → if `SENT`, inspect
+provider response and device diagnostics; if `PENDING/SENDING/DLQ`, follow
+`trace_id` to the failing stage; if no event exists, edge logs and
+signature-failure metrics decide whether Cal never sent it or we rejected it
+before persistence.
 
 ## What I'd do differently with more time/budget
 
-I'd replace "insert into Mongo, then enqueue SQS" with an **outbox pattern
-driven by Mongo change streams** — Debezium or a homegrown CDC consumer reads
-the oplog and produces to Kafka. This removes the dual-write hazard between
-Mongo and SQS (handler crashes between the two, janitor cleans up — it works,
-but it's a moving part). I'd add a small **schema registry** for Cal events so
-a new `event_type` doesn't silently land in the DLQ. I'd add **mTLS to Cal** on
-top of HMAC as defence in depth. And I'd switch to **SQS FIFO with
-`MessageGroupId = card_id`** for per-card ordering — right now I tolerate
-reordering because the brief says Cal does not guarantee it, but ordered
-delivery would simplify the state machine for `activated → blocked → replaced`
-transitions. I cut these because each of them adds operational surface area
-(another consumer, another schema store, another protocol) that isn't required
-to meet the brief, and the unique-index-plus-conditional-update primitive is
-already enough to make exactly-once correct.
+I would replace the handler's dual write (Mongo + SQS) with a formal outbox
+driven by MongoDB change streams, closing the dual-write gap instead of
+leaning on the janitor. I would add richer schema validation including Cal
+event-version negotiation, and mTLS on top of HMAC if Cal supports client
+certificates. These stayed out of v1 because the unique-index plus claim plus
+retry path already meets the correctness requirements with less operational
+surface area.
+
